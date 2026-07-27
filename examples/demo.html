@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OPA RUM Beacon - Demo & Verification</title>
+
+  <!--
+    OPA RUM beacon.
+    - data-endpoint="" (empty) => same origin. Served by the dashboard at :8088,
+      whose nginx proxies /api/* to the agent (agent:8080). The beacon POSTs to
+      <endpoint>/api/rum via navigator.sendBeacon() when the page is hidden.
+    - Loaded in <head> so PerformanceObserver (LCP/CLS/INP) and the AJAX/error
+      hooks register before the page starts doing work.
+
+    NOTE ON CSP: the production dashboard (nginx.conf) sends a strict
+    Content-Security-Policy (default-src 'self', no 'unsafe-inline'). That blocks
+    the *inline* orchestration script and inline styles on THIS page. The beacon
+    itself is a same-origin external script and loads fine, and same-origin
+    sendBeacon/fetch to /api are allowed by connect-src 'self'. To exercise the
+    inline demo logic (buttons, fetch bursts, forced CLS), serve this page from a
+    context that permits inline execution:
+        npm run dev      (Vite dev server on :3000, proxies /api -> agent)
+        npm run preview  (vite preview of the built bundle)
+        open the file directly (file://) for a CSP-free smoke test
+    or temporarily add 'unsafe-inline' to script-src/style-src in nginx.conf.
+  -->
+  <script
+    src="../dist/opa-rum.js"
+    data-endpoint=""
+    data-organization-id="KtBteaXLMGcBQDF3Ov8tmg=="
+    data-project-id="LmDJSlcleQoQNEVk8bKL9Q=="
+    data-sample-rate="1"
+    data-debug="true"></script>
+
+  <!-- Same-origin CSS resource (populates resource timing as a "link"/"css" entry). -->
+  <link rel="stylesheet" href="data:text/css,.opa-rum-demo-marker%7Bfont-style:italic%7D" />
+
+  <style>
+    :root { color-scheme: light dark; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+      line-height: 1.5;
+      color: #1a1a1a;
+      background: #f6f7f9;
+    }
+    header {
+      background: #0f172a;
+      color: #f8fafc;
+      padding: 20px 24px;
+    }
+    header h1 { margin: 0 0 4px; font-size: 20px; }
+    header p { margin: 0; font-size: 13px; color: #cbd5e1; }
+    main { max-width: 860px; margin: 0 auto; padding: 24px 16px 64px; }
+    section {
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 8px;
+      padding: 16px 18px;
+      margin: 16px 0;
+    }
+    h2 { font-size: 15px; margin: 0 0 8px; text-transform: uppercase; letter-spacing: .04em; color: #475569; }
+    .hero { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; }
+    .hero img { border-radius: 6px; }
+    .lcp-block { font-size: 26px; font-weight: 700; color: #0f172a; flex: 1 1 320px; }
+    button {
+      font: inherit; cursor: pointer; border: 1px solid #94a3b8;
+      background: #fff; padding: 8px 14px; border-radius: 6px; margin: 4px 6px 4px 0;
+    }
+    button.primary { background: #2563eb; border-color: #2563eb; color: #fff; }
+    button.danger  { background: #dc2626; border-color: #dc2626; color: #fff; }
+    code { background: #eef2f7; padding: 1px 5px; border-radius: 4px; font-size: 13px; }
+    #log {
+      font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size: 12px; white-space: pre-wrap; background: #0b1020; color: #d1e0ff;
+      border-radius: 6px; padding: 12px; max-height: 260px; overflow: auto; margin: 0;
+    }
+    .cls-slot { min-height: 8px; }
+    .filler { color: #334155; }
+    @media (prefers-color-scheme: dark) {
+      body { background: #0b1020; color: #e5e9f0; }
+      section { background: #131a2b; border-color: #24314d; }
+      .lcp-block { color: #e5e9f0; }
+      code { background: #1e293b; color: #cbd5e1; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>OPA RUM Beacon &mdash; Demo &amp; Verification</h1>
+    <p>Loads <code>/opa-rum.js</code> and generates realistic RUM activity (Core Web Vitals, resource &amp; nav timing, AJAX, JS errors) so you can verify the pipeline end to end.</p>
+  </header>
+
+  <main>
+    <section>
+      <h2>What this page does</h2>
+      <ul class="filler">
+        <li>Registers the beacon in <code>&lt;head&gt;</code> with <code>data-debug="true"</code> &mdash; open DevTools console to watch it work.</li>
+        <li>Loads images and a stylesheet to populate <strong>resource timing</strong>.</li>
+        <li>Fires several <code>fetch()</code> calls to <code>/api/*</code> (populates <strong>ajax_requests</strong>), including one deliberate <strong>404</strong>.</li>
+        <li>Injects a late, un-sized image to produce a <strong>layout shift (CLS)</strong>.</li>
+        <li>Buttons below let you raise an uncaught error and flush the beacon on demand.</li>
+      </ul>
+      <p class="filler">Tenant: org <code>KtBteaXLMGcBQDF3Ov8tmg==</code> / project <code>LmDJSlcleQoQNEVk8bKL9Q==</code>. Endpoint: same origin &rarr; <code>/api/rum</code>.</p>
+    </section>
+
+    <section>
+      <h2>Hero (LCP candidate)</h2>
+      <div class="hero">
+        <!-- Large-ish data-URI image: content for LCP, no network needed. -->
+        <img width="180" height="180" alt="OPA logo"
+             src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='180'%20height='180'%3E%3Crect%20width='180'%20height='180'%20rx='16'%20fill='%232563eb'/%3E%3Ccircle%20cx='90'%20cy='90'%20r='54'%20fill='none'%20stroke='%23fff'%20stroke-width='10'/%3E%3Ctext%20x='90'%20y='150'%20font-family='sans-serif'%20font-size='22'%20fill='%23fff'%20text-anchor='middle'%3EOPA%20RUM%3C/text%3E%3C/svg%3E" />
+        <div class="lcp-block">Real User Monitoring, verified from a real browser session.</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Network resources</h2>
+      <p class="filler">A second same-origin data-URI image plus one cross-origin HTTPS image (adds a real cross-origin resource-timing entry when CSP permits it):</p>
+      <p>
+        <img width="120" height="60" alt="badge"
+             src="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='120'%20height='60'%3E%3Crect%20width='120'%20height='60'%20rx='8'%20fill='%2316a34a'/%3E%3Ctext%20x='60'%20y='38'%20font-family='sans-serif'%20font-size='16'%20fill='%23fff'%20text-anchor='middle'%3EBEACON%3C/text%3E%3C/svg%3E" />
+        <img width="200" height="100" alt="external sample"
+             src="https://picsum.photos/seed/opa-rum/200/100" referrerpolicy="no-referrer" />
+      </p>
+    </section>
+
+    <section>
+      <h2>Controls</h2>
+      <button id="btn-fetch" class="primary" type="button">Re-run API calls</button>
+      <button id="btn-error" class="danger" type="button">Throw error</button>
+      <button id="btn-flush" type="button">Flush now</button>
+      <p class="filler" style="margin-bottom:0">
+        <strong>Throw error</strong> raises an uncaught <code>Error</code> (captured via the global <code>error</code> handler).
+        <strong>Flush now</strong> calls <code>window.OpaRum.flush()</code>. The beacon also auto-flushes on page hide / tab close.
+      </p>
+    </section>
+
+    <!-- CLS target: a late, un-sized image gets inserted here, pushing content down. -->
+    <div id="cls-slot" class="cls-slot"></div>
+
+    <section>
+      <h2>Filler content (gives the page height for LCP)</h2>
+      <p class="filler">Lorem ipsum dolor sit amet, consectetur adipiscing elit. Real user monitoring records how the page actually behaves in the field: how long the largest element takes to paint, how much the layout shifts as things load, how long AJAX calls take, and any JavaScript errors that surface. This block simply adds enough content that the browser has a meaningful largest contentful paint to report.</p>
+      <p class="filler">Scroll or interact to also register an interaction (INP). When you leave the tab, the beacon sends its final payload with settled Core Web Vitals via <code>navigator.sendBeacon()</code>.</p>
+    </section>
+
+    <section>
+      <h2>Activity log</h2>
+      <pre id="log">Booting demo...\n</pre>
+    </section>
+  </main>
+
+  <script>
+    (function () {
+      'use strict';
+      var logEl = document.getElementById('log');
+      function log(msg) {
+        var line = '[' + new Date().toLocaleTimeString() + '] ' + msg + '\n';
+        if (logEl) logEl.textContent += line;
+        // eslint-disable-next-line no-console
+        console.log('[rum-demo]', msg);
+      }
+
+      // --- AJAX activity: same-origin /api calls (populate ajax_requests) ---
+      function callApi(path, label) {
+        var t0 = performance.now();
+        return fetch(path, { headers: { 'Accept': 'application/json' } })
+          .then(function (res) {
+            var ms = Math.round(performance.now() - t0);
+            log(label + ' -> ' + res.status + ' (' + ms + 'ms)');
+            return res;
+          })
+          .catch(function (err) {
+            log(label + ' -> network error: ' + err.message);
+          });
+      }
+
+      function runApiBurst() {
+        log('Firing API calls...');
+        callApi('/api/services/metadata', 'GET /api/services/metadata');
+        callApi('/api/rum/metrics', 'GET /api/rum/metrics');
+        callApi('/api/rum/metrics?window=1h', 'GET /api/rum/metrics?window=1h');
+        // Deliberate 404 so an error / 4xx AJAX entry is recorded.
+        callApi('/api/this-endpoint-does-not-exist', 'GET /api/this-endpoint-does-not-exist (expect 404)');
+      }
+
+      // --- Forced layout shift (CLS): inject a late, un-sized image ---
+      function forceLayoutShift() {
+        setTimeout(function () {
+          var slot = document.getElementById('cls-slot');
+          if (!slot) return;
+          var img = document.createElement('img');
+          // No width/height attributes => the browser reflows when it paints,
+          // shifting everything below it and producing a measurable CLS.
+          img.alt = 'late banner';
+          img.src = "data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20width='820'%20height='140'%3E%3Crect%20width='820'%20height='140'%20fill='%23f59e0b'/%3E%3Ctext%20x='410'%20y='82'%20font-family='sans-serif'%20font-size='24'%20fill='%23111'%20text-anchor='middle'%3ELate%20banner%20(causes%20CLS)%3C/text%3E%3C/svg%3E";
+          img.style.maxWidth = '100%';
+          img.style.display = 'block';
+          slot.appendChild(img);
+          log('Injected late un-sized image (layout shift).');
+        }, 900);
+      }
+
+      // --- Wire up buttons ---
+      var fetchBtn = document.getElementById('btn-fetch');
+      if (fetchBtn) fetchBtn.addEventListener('click', runApiBurst);
+
+      var errBtn = document.getElementById('btn-error');
+      if (errBtn) errBtn.addEventListener('click', function () {
+        log('Raising an uncaught error...');
+        // Deferred so it is genuinely uncaught (reaches window "error"), not
+        // swallowed by this click handler.
+        setTimeout(function () {
+          throw new Error('OPA RUM demo: intentional uncaught error at ' + Date.now());
+        }, 0);
+      });
+
+      var flushBtn = document.getElementById('btn-flush');
+      if (flushBtn) flushBtn.addEventListener('click', function () {
+        if (window.OpaRum && typeof window.OpaRum.flush === 'function') {
+          window.OpaRum.flush();
+          log('Called window.OpaRum.flush().');
+        } else {
+          log('window.OpaRum.flush() not available (is /opa-rum.js loaded & not sampled out?).');
+        }
+      });
+
+      // --- Kick things off after load ---
+      window.addEventListener('load', function () {
+        log('Page loaded. OpaRum present: ' + !!window.OpaRum);
+        forceLayoutShift();
+        // Small delay so the initial navigation/resource timings settle first.
+        setTimeout(runApiBurst, 300);
+      });
+    })();
+  </script>
+</body>
+</html>
