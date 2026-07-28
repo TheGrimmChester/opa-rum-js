@@ -19,7 +19,10 @@ and reliability data, then ships it to your OPA agent for the dashboard's
 - **AJAX** — `fetch()` and `XMLHttpRequest` calls with method, URL, status,
   duration (4xx/5xx and slow calls show up)
 - **JavaScript errors** — uncaught errors + unhandled promise rejections
-- **Sessions** — a `sessionStorage` session id + per-load page-view id
+- **Sessions** — a `sessionStorage` session id + per-page-view id, rotated on
+  SPA route changes
+- **Trace correlation** — eligible AJAX calls carry a W3C `traceparent` header
+  and record the trace id, linking a slow browser call to the backend trace
 
 ## Quick start
 
@@ -60,9 +63,45 @@ Or configure via a global before the script loads:
 | `data-project-id`       | `projectId`          | —           | Public project id. |
 | `data-sample-rate`      | `sampleRate`         | `1`         | Fraction of sessions to record (`0.1` = 10%). |
 | `data-debug`            | `debug`              | `false`     | Log beacon activity to the console. |
+| `data-trace-propagation-targets` | `tracePropagationTargets` | `[]` (same-origin only) | Extra origins/prefixes allowed to receive the `traceparent` header. Comma-separated in the attribute form, an array in `OPA_RUM_CONFIG`. |
 
 The organization/project ids are **public routing keys**, not secrets — safe to
 embed in client-side HTML.
+
+## Trace correlation
+
+Eligible AJAX calls (`fetch` and `XMLHttpRequest`) get a W3C trace context:
+
+```
+traceparent: 00-<32-hex trace id>-<16-hex span id>-01
+```
+
+The same trace id is stored on the call's `ajax_requests` entry, so the
+dashboard can take you from a slow browser request straight to the backend
+trace that served it. A `traceparent` your own code already set is left alone.
+
+**Eligibility is same-origin by default.** Cross-origin requests are only
+traced when their URL starts with one of `tracePropagationTargets`, because
+sending the header to a third party would both leak your trace ids and trip
+CORS preflight (`traceparent` is not a CORS-safelisted header, so the other end
+must allow it). Opt an API in explicitly:
+
+```html
+<script src="/opa-rum.js"
+  data-trace-propagation-targets="https://api.example.com,https://cdn.example.com"></script>
+```
+
+## Single-page apps
+
+`history.pushState`, `history.replaceState` and `popstate` are treated as page
+views: the beacon flushes what belongs to the outgoing route, then starts a
+fresh page view — new `page_view_id`, cleared AJAX and error buffers, the
+**same** `session_id`. A same-URL re-push is ignored. So an SPA reports per
+route instead of once per tab, and the Sessions view shows the real navigation
+path. (A history navigation produces no Navigation Timing entry, so those
+page views carry no `navigation_timing`.)
+
+Every payload includes `sdk_version` for server-side compatibility checks.
 
 ## Delivery
 
