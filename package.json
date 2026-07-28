@@ -6,6 +6,12 @@
   "files": ["dist/opa-rum.js", "README.md", "LICENSE"],
   "keywords": ["rum", "real-user-monitoring", "web-vitals", "apm", "performance", "beacon", "opa"],
   "repository": { "type": "git", "url": "https://github.com/TheGrimmChester/opa-rum-js.git" },
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "devDependencies": {
+    "happy-dom": "^20.11.1"
+  },
   "license": "MIT",
   "author": "TheGrimmChester"
 }
