@@ -6,7 +6,7 @@ Drop one `<script>` tag on any page and it collects real-browser performance
 and reliability data, then ships it to your OPA agent for the dashboard's
 **Browser (RUM)** views.
 
-- **Zero dependencies** · vanilla ES2017 IIFE · ~7 KB gzipped
+- **Zero dependencies** · vanilla ES2017 IIFE · ~6 KB gzipped (20 KB raw)
 - **Safe by construction** — every hook wraps + calls through and swallows its
   own errors; it can never break the host page
 - **Privacy-aware** — query strings are stripped from beaconed URLs
@@ -66,18 +66,25 @@ embed in client-side HTML.
 
 ## Delivery
 
-The beacon batches everything and POSTs JSON to `<endpoint>/api/rum` via
-`navigator.sendBeacon()` when the page is hidden (`visibilitychange` → hidden,
-`pagehide`), plus a one-time safety flush ~4 s after load — so short-lived tabs
-still report and the final payload carries settled vitals. `fetch(keepalive)`
-is the fallback. Call `window.OpaRum.flush()` manually (e.g. on SPA route
-changes).
+There is **no build step**: the beacon ships as a single ready-to-serve file,
+[`dist/opa-rum.js`](dist/opa-rum.js). Copy it (or serve it straight from this
+repo) next to your pages and reference it with a `<script>` tag as shown above.
+
+At runtime the beacon batches everything and POSTs JSON to
+`<endpoint>/api/rum` via `navigator.sendBeacon()` when the page is hidden
+(`visibilitychange` → hidden, `pagehide`), plus a one-time safety flush ~4 s
+after load — so short-lived tabs still report and the final payload carries
+settled vitals. `fetch(keepalive)` is the fallback. Call
+`window.OpaRum.flush()` manually (e.g. on SPA route changes).
 
 ## Demo
 
-Open [`examples/demo.html`](examples/demo.html) served next to an OPA
-dashboard/agent — it generates vitals, resources, AJAX (including a deliberate
-404), and JS errors, with buttons to throw an error and flush on demand.
+Open [`examples/demo.html`](examples/demo.html) next to a **running OPA
+dashboard/agent** — the page needs either a same-origin `/api/rum` endpoint
+(serve the demo from the dashboard's origin) or a `data-endpoint` attribute
+pointing at the agent's origin. The demo generates vitals, resources, AJAX
+(including a deliberate 404), and JS errors, with buttons to throw an error
+and flush on demand.
 
 ## License
 
