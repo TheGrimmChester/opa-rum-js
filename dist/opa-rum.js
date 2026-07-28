@@ -19,11 +19,22 @@
  * timing, AJAX (fetch + XHR), and JS errors, then ships them to
  * <endpoint>/api/rum via navigator.sendBeacon (fetch keepalive fallback).
  *
+ * v0.2 additions:
+ *   - Trace correlation: same-origin fetch/XHR calls (plus any URL matching a
+ *     configured tracePropagationTargets prefix; data-trace-propagation-targets
+ *     as a comma-separated attribute) carry a W3C `traceparent` header, and the
+ *     matching ajax_requests entry records its trace_id.
+ *   - SPA page views: history.pushState/replaceState + popstate route changes
+ *     flush the outgoing page view and start a fresh one (new page_view_id,
+ *     fresh ajax/error buffers, empty navigation_timing).
+ *
  * The JSON payload matches the OPA ingest contract exactly — see main.go
  * (mux.HandleFunc("/api/rum", ...)) and the RUM dashboard.
  */
 (function () {
     'use strict';
+
+    var SDK_VERSION = '0.2.0';
 
     // ---------------------------------------------------------------------
     // Configuration resolution.
@@ -75,12 +86,27 @@
     var rawDebug = pick(globalCfg.debug, attr('data-debug'), false);
     var DEBUG = rawDebug === true || rawDebug === 'true' || rawDebug === '1';
 
+    // Trace propagation targets: URL/origin prefixes (in addition to the page's
+    // own origin) whose requests may carry a `traceparent` header. Accepts an
+    // array (global config) or a comma-separated string (data attribute).
+    function parseTraceTargets(raw) {
+        if (raw == null || raw === '') return [];
+        var list = Array.isArray(raw) ? raw : String(raw).split(',');
+        var out = [];
+        for (var i = 0; i < list.length; i++) {
+            var t = String(list[i]).trim();
+            if (t) out.push(t);
+        }
+        return out;
+    }
+
     var CONFIG = {
         endpoint: normEndpoint(pick(globalCfg.endpoint, attr('data-endpoint'))),
         organizationId: pick(globalCfg.organizationId, attr('data-organization-id'), '') || '',
         projectId: pick(globalCfg.projectId, attr('data-project-id'), '') || '',
         sampleRate: sampleRate,
-        debug: DEBUG
+        debug: DEBUG,
+        tracePropagationTargets: parseTraceTargets(pick(globalCfg.tracePropagationTargets, attr('data-trace-propagation-targets')))
     };
 
     var INGEST_URL = CONFIG.endpoint + '/api/rum';
@@ -135,6 +161,126 @@
 
     var SESSION_ID = getSessionId();
     var PAGE_VIEW_ID = randomId();
+
+    // ---------------------------------------------------------------------
+    // Trace correlation (W3C Trace Context). Requests to the page's own
+    // origin — or to any configured tracePropagationTargets prefix — carry a
+    // `traceparent: 00-<trace-id>-<span-id>-01` header, so backend spans can
+    // be joined to the RUM ajax entry via its recorded trace_id.
+    // ---------------------------------------------------------------------
+    function randomHex(bytes) {
+        var i;
+        try {
+            if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+                var buf = new Uint8Array(bytes);
+                window.crypto.getRandomValues(buf);
+                var hex = '';
+                for (i = 0; i < buf.length; i++) {
+                    hex += (buf[i] + 0x100).toString(16).slice(1);
+                }
+                return hex;
+            }
+        } catch (e) {}
+        // Math.random fallback — opaque correlation ids, same spirit as randomId().
+        var out = '';
+        for (i = 0; i < bytes * 2; i++) {
+            out += ((Math.random() * 16) | 0).toString(16);
+        }
+        return out;
+    }
+
+    // Fresh per-call trace context: 16-byte trace id, 8-byte span id.
+    function makeTraceContext() {
+        return { traceId: randomHex(16), spanId: randomHex(8) };
+    }
+
+    function traceparentValue(ctx) {
+        return '00-' + ctx.traceId + '-' + ctx.spanId + '-01';
+    }
+
+    // Should a request to `url` carry a traceparent header? True for
+    // same-origin URLs and for URLs matching a configured target prefix.
+    // Cross-origin URLs matching nothing get no header (avoids CORS breakage
+    // and leaking ids to third parties).
+    function shouldPropagateTrace(url) {
+        try {
+            var raw = String(url == null ? '' : url);
+            var abs = raw;
+            var sameOrigin = false;
+            var Ctor = (typeof URL === 'function') ? URL : window.URL;
+            if (typeof Ctor === 'function') {
+                var u = new Ctor(raw, window.location.href);
+                abs = u.href;
+                sameOrigin = (u.origin === window.location.origin);
+            } else {
+                // No URL constructor: scheme-less, non-protocol-relative URLs
+                // are same-origin by definition.
+                sameOrigin = !/^([a-z][a-z0-9+.-]*:)?\/\//i.test(raw);
+            }
+            if (sameOrigin) return true;
+            var targets = CONFIG.tracePropagationTargets;
+            for (var i = 0; i < targets.length; i++) {
+                if (abs.indexOf(targets[i]) === 0 || raw.indexOf(targets[i]) === 0) return true;
+            }
+        } catch (e) {}
+        return false;
+    }
+
+    // Return a fetch `init` whose headers carry the traceparent header while
+    // preserving whatever headers were already there — as a Headers instance,
+    // an array of pairs, a plain object, or on a Request input. (Passing
+    // init.headers alongside a Request replaces the Request's headers
+    // wholesale, so those must be copied across, not dropped.)
+    function withTraceparent(input, init, value) {
+        var newInit = {};
+        var k;
+        if (init) {
+            for (k in init) {
+                if (Object.prototype.hasOwnProperty.call(init, k)) newInit[k] = init[k];
+            }
+        }
+
+        var HeadersCtor = null;
+        try { HeadersCtor = (typeof Headers === 'function') ? Headers : window.Headers; } catch (e) {}
+
+        var base = null;
+        if (init && init.headers != null) {
+            base = init.headers;
+        } else if (input && typeof input === 'object' && input.headers &&
+                   typeof input.headers.forEach === 'function') {
+            base = input.headers; // Request instance
+        }
+
+        if (Array.isArray(base)) {
+            var arr = base.slice();
+            arr.push(['traceparent', value]);
+            newInit.headers = arr;
+        } else if (base && typeof base.forEach === 'function' && typeof base.set === 'function') {
+            // Headers(-like) instance — clone before touching the caller's object.
+            var h = (typeof HeadersCtor === 'function') ? new HeadersCtor(base) : base;
+            h.set('traceparent', value);
+            newInit.headers = h;
+        } else if (base && typeof base === 'object') {
+            var obj = {};
+            for (k in base) {
+                if (Object.prototype.hasOwnProperty.call(base, k)) obj[k] = base[k];
+            }
+            obj.traceparent = value;
+            newInit.headers = obj;
+        } else {
+            newInit.headers = { traceparent: value };
+        }
+        return newInit;
+    }
+
+    // The URL the current page view is attributed to. Captured up front (and on
+    // every SPA route change) rather than read at flush time, so a route change
+    // never re-labels data that belongs to the previous view.
+    var PAGE_URL = window.location.href;
+
+    // SPA (history API) views have no Navigation Timing entry of their own, so
+    // navigation_timing is sent empty for them.
+    var IS_SPA_VIEW = false;
 
     // ---------------------------------------------------------------------
     // Buffers (capped so a long-lived page can't grow the payload unbounded).
@@ -309,21 +455,34 @@
                 if (init && init.method) method = init.method;
             } catch (e) {}
 
+            // Trace correlation: eligible calls get a fresh trace context and
+            // a traceparent request header; the ajax entry records the trace id.
+            var traceId = null;
+            try {
+                if (shouldPropagateTrace(url)) {
+                    var tctx = makeTraceContext();
+                    init = withTraceparent(input, init, traceparentValue(tctx));
+                    traceId = tctx.traceId;
+                }
+            } catch (e) { traceId = null; }
+
             var record = function (status) {
                 try {
-                    pushCapped(ajaxRequests, {
+                    var entry = {
                         url: url,
                         method: method,
                         duration: Math.round(now() - startedAt),
                         status: status
-                    }, MAX_AJAX);
+                    };
+                    if (traceId) entry.trace_id = traceId;
+                    pushCapped(ajaxRequests, entry, MAX_AJAX);
                     markDirty();
                 } catch (e) {}
             };
 
             var p;
             try {
-                p = originalFetch.apply(this, arguments);
+                p = originalFetch.call(this, input, init);
             } catch (e) {
                 record(0);
                 throw e;
@@ -356,14 +515,28 @@
             var xhr = this;
             try {
                 var startedAt = now();
+
+                // Trace correlation: request headers may only be set between
+                // open() and send(), which is exactly where this wrapper runs.
+                var traceId = null;
+                try {
+                    if (shouldPropagateTrace(xhr.__opaUrl || '')) {
+                        var tctx = makeTraceContext();
+                        xhr.setRequestHeader('traceparent', traceparentValue(tctx));
+                        traceId = tctx.traceId;
+                    }
+                } catch (e) { traceId = null; }
+
                 xhr.addEventListener('loadend', function () {
                     try {
-                        pushCapped(ajaxRequests, {
+                        var entry = {
                             url: xhr.__opaUrl || '',
                             method: xhr.__opaMethod || 'GET',
                             duration: Math.round(now() - startedAt),
                             status: xhr.status || 0
-                        }, MAX_AJAX);
+                        };
+                        if (traceId) entry.trace_id = traceId;
+                        pushCapped(ajaxRequests, entry, MAX_AJAX);
                         markDirty();
                     } catch (e) {}
                 });
@@ -416,20 +589,64 @@
     }
 
     // ---------------------------------------------------------------------
+    // SPA page views: every history route change closes out the current page
+    // view (flush) and starts a fresh one — new page_view_id, fresh ajax and
+    // error buffers (the session id is kept), and no navigation_timing, since
+    // a history navigation produces no Navigation Timing entry.
+    // ---------------------------------------------------------------------
+    function onRouteChange() {
+        try {
+            var href = window.location.href;
+            if (href === PAGE_URL) return; // same-URL no-op (re-pushed state)
+
+            // Ship what belongs to the outgoing view first; buildPayload()
+            // attributes it to PAGE_URL, which still holds the old location.
+            flush();
+
+            PAGE_VIEW_ID = randomId();
+            PAGE_URL = href;
+            IS_SPA_VIEW = true;
+            ajaxRequests.length = 0;
+            errors.length = 0;
+            dirty = true; // the new view is itself reportable data
+            log('spa route change', { pageView: PAGE_VIEW_ID, url: PAGE_URL });
+        } catch (e) {}
+    }
+
+    function instrumentHistory() {
+        try {
+            var h = window.history;
+            if (!h) return;
+            ['pushState', 'replaceState'].forEach(function (name) {
+                var original = h[name];
+                if (typeof original !== 'function') return;
+                h[name] = function () {
+                    var result = original.apply(this, arguments);
+                    onRouteChange();
+                    return result;
+                };
+            });
+            window.addEventListener('popstate', onRouteChange);
+        } catch (e) {}
+    }
+
+    // ---------------------------------------------------------------------
     // Flush: assemble the payload (matching the ingest contract EXACTLY) and
     // ship it. sendBeacon can't set headers, so org/project ids live only in
     // the JSON body.
     // ---------------------------------------------------------------------
     function buildPayload() {
         return {
+            sdk_version: SDK_VERSION,
             organization_id: CONFIG.organizationId,
             project_id: CONFIG.projectId,
             session_id: SESSION_ID,
             page_view_id: PAGE_VIEW_ID,
-            page_url: window.location.href,
+            page_url: PAGE_URL,
             user_agent: navigator.userAgent,
             timestamp: Date.now(),
-            navigation_timing: snapshotNavigation(),
+            // SPA views have no Navigation Timing entry of their own.
+            navigation_timing: IS_SPA_VIEW ? {} : snapshotNavigation(),
             web_vitals: snapshotVitals(),
             resource_timing: snapshotResources(),
             ajax_requests: ajaxRequests.slice(0, MAX_AJAX),
@@ -488,6 +705,7 @@
     instrumentFetch();
     instrumentXHR();
     instrumentErrors();
+    instrumentHistory();
 
     // Flush when the tab is backgrounded/closed — the most reliable moment to
     // capture settled vitals without racing the unload.
