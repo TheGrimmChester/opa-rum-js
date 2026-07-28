@@ -38,6 +38,7 @@ function loadBeacon(options = {}) {
     // accessors rely on private class fields, so delegation via Object.create
     // breaks — use a plain object exposing just what the beacon reads.
     const beaconCalls = [];
+    const fetchCalls = [];
     const navigator = {
         userAgent: window.navigator.userAgent,
         sendBeacon(url, body) {
@@ -51,6 +52,17 @@ function loadBeacon(options = {}) {
         now: () => Date.now(),
         getEntriesByType: () => []
     };
+
+    // Capturing fetch. The beacon wraps `window.fetch`, so the stub has to live
+    // there (happy-dom's own fetch would hit the network); the recorded calls
+    // are what the wrapper forwarded — where traceparent injection is visible.
+    const fetchStub = (input, init) => {
+        fetchCalls.push({ input, init });
+        return Promise.resolve({ status: 200 });
+    };
+    Object.defineProperty(window, 'fetch', {
+        configurable: true, writable: true, value: fetchStub
+    });
 
     // --- script element carrying data-* config, when requested.
     let scriptEl = null;
@@ -87,7 +99,9 @@ function loadBeacon(options = {}) {
         // Swallow the 4s safety flush so nothing keeps the test alive.
         setTimeout: () => ({ unref() {} }),
         clearTimeout: () => {},
-        fetch: () => Promise.resolve({ status: 200 })
+        // Bare `fetch` references resolve to the same stub the beacon wraps on
+        // window (see fetchStub above).
+        fetch: fetchStub
     };
     const context = vm.createContext(sandbox);
     // Deterministic sampling: 0.5 > 1 is false (sampled at rate 1),
@@ -96,7 +110,19 @@ function loadBeacon(options = {}) {
 
     vm.runInContext(BEACON_SOURCE, context, { filename: 'opa-rum.js' });
 
-    return { window, beaconCalls, close: () => window.close() };
+    return { window, beaconCalls, fetchCalls, close: () => window.close() };
+}
+
+// Pull the traceparent value out of whatever header shape the wrapper produced.
+function traceparentOf(init) {
+    const h = init && init.headers;
+    if (!h) return null;
+    if (Array.isArray(h)) {
+        const hit = h.find((pair) => String(pair[0]).toLowerCase() === 'traceparent');
+        return hit ? hit[1] : null;
+    }
+    if (typeof h.get === 'function') return h.get('traceparent');
+    return h.traceparent || h.Traceparent || null;
 }
 
 async function readBody(body) {
@@ -187,6 +213,98 @@ test('config via <script data-*> attributes (document.currentScript)', async () 
         const payload = JSON.parse(await readBody(beaconCalls[0].body));
         assert.strictEqual(payload.organization_id, 'org-from-attr');
         assert.strictEqual(payload.project_id, 'proj-from-attr');
+    } finally {
+        close();
+    }
+});
+
+// --- v0.2: RUM ↔ trace correlation -----------------------------------------
+
+test('same-origin AJAX carries a traceparent header and records its trace_id', async () => {
+    const { window, beaconCalls, fetchCalls, close } = loadBeacon({
+        config: { endpoint: 'http://x', organizationId: 'o', projectId: 'p', sampleRate: 1 }
+    });
+
+    try {
+        // Page origin is http://localhost:8080 (see loadBeacon).
+        await window.fetch('http://localhost:8080/api/orders');
+
+        assert.strictEqual(fetchCalls.length, 1, 'the wrapper called through to the original fetch');
+        const tp = traceparentOf(fetchCalls[0].init);
+        assert.ok(tp, 'a traceparent header was injected');
+        assert.match(tp, /^00-[0-9a-f]{32}-[0-9a-f]{16}-01$/, 'traceparent is well-formed W3C');
+
+        window.OpaRum.flush();
+        const payload = JSON.parse(await readBody(beaconCalls[0].body));
+        assert.strictEqual(payload.ajax_requests.length, 1);
+        const entry = payload.ajax_requests[0];
+        assert.ok(entry.trace_id, 'the ajax entry records a trace_id');
+        assert.strictEqual(
+            tp.split('-')[1], entry.trace_id,
+            'recorded trace_id matches the trace id sent on the wire'
+        );
+        assert.strictEqual(payload.sdk_version, '0.2.0');
+    } finally {
+        close();
+    }
+});
+
+test('cross-origin AJAX is not traced unless allow-listed', async () => {
+    const { window, beaconCalls, fetchCalls, close } = loadBeacon({
+        config: { endpoint: 'http://x', organizationId: 'o', projectId: 'p', sampleRate: 1 }
+    });
+
+    try {
+        await window.fetch('https://third-party.example.com/pixel');
+
+        assert.strictEqual(traceparentOf(fetchCalls[0].init), null, 'no header on a foreign origin');
+
+        window.OpaRum.flush();
+        const payload = JSON.parse(await readBody(beaconCalls[0].body));
+        assert.strictEqual(payload.ajax_requests[0].trace_id, undefined, 'no trace_id recorded');
+    } finally {
+        close();
+    }
+});
+
+test('tracePropagationTargets opts a cross-origin API into tracing', async () => {
+    const { window, fetchCalls, close } = loadBeacon({
+        config: {
+            endpoint: 'http://x', organizationId: 'o', projectId: 'p', sampleRate: 1,
+            tracePropagationTargets: ['https://api.example.com']
+        }
+    });
+
+    try {
+        await window.fetch('https://api.example.com/v1/orders');
+        assert.match(traceparentOf(fetchCalls[0].init) || '', /^00-[0-9a-f]{32}-/);
+    } finally {
+        close();
+    }
+});
+
+test('an SPA route change flushes the old page view and starts a new one', async () => {
+    const { window, beaconCalls, close } = loadBeacon({
+        config: { endpoint: 'http://x', organizationId: 'o', projectId: 'p', sampleRate: 1 }
+    });
+
+    try {
+        window.history.pushState({}, '', '/next-route');
+
+        assert.ok(beaconCalls.length >= 1, 'the route change flushed the previous page view');
+        const first = JSON.parse(await readBody(beaconCalls[0].body));
+
+        // Make the new page view dirty so it is allowed to flush, then send it.
+        await window.fetch('http://localhost:8080/api/after-nav');
+        window.OpaRum.flush();
+
+        const second = JSON.parse(await readBody(beaconCalls[beaconCalls.length - 1].body));
+        assert.notStrictEqual(
+            second.page_view_id, first.page_view_id,
+            'the post-navigation payload uses a fresh page_view_id'
+        );
+        assert.strictEqual(second.session_id, first.session_id, 'the session id is preserved');
+        assert.ok(String(second.page_url).endsWith('/next-route'), 'page_url tracks the new route');
     } finally {
         close();
     }
