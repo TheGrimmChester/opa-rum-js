@@ -20,13 +20,11 @@
  * <endpoint>/api/rum via navigator.sendBeacon (fetch keepalive fallback).
  *
  * v0.2 additions:
- *   - Trace correlation: same-origin fetch/XHR calls (plus any URL matching a
- *     configured tracePropagationTargets prefix; data-trace-propagation-targets
- *     as a comma-separated attribute) carry a W3C `traceparent` header, and the
- *     matching ajax_requests entry records its trace_id.
- *   - SPA page views: history.pushState/replaceState + popstate route changes
- *     flush the outgoing page view and start a fresh one (new page_view_id,
- *     fresh ajax/error buffers, empty navigation_timing).
+ *   - Trace correlation + SPA page views.
+ * v0.3 (Wave 12):
+ *   - Route normalization, setUser/addAction/addTiming, device+connection,
+ *     element-level CWV, long tasks, bfcache lifecycle, consent mode,
+ *     optional session-replay mutation chunks, framework hooks.
  *
  * The JSON payload matches the OPA ingest contract exactly — see main.go
  * (mux.HandleFunc("/api/rum", ...)) and the RUM dashboard.
@@ -34,7 +32,7 @@
 (function () {
     'use strict';
 
-    var SDK_VERSION = '0.2.0';
+    var SDK_VERSION = '0.3.0';
 
     // ---------------------------------------------------------------------
     // Configuration resolution.
@@ -106,7 +104,13 @@
         projectId: pick(globalCfg.projectId, attr('data-project-id'), '') || '',
         sampleRate: sampleRate,
         debug: DEBUG,
-        tracePropagationTargets: parseTraceTargets(pick(globalCfg.tracePropagationTargets, attr('data-trace-propagation-targets')))
+        tracePropagationTargets: parseTraceTargets(pick(globalCfg.tracePropagationTargets, attr('data-trace-propagation-targets'))),
+        release: pick(globalCfg.release, attr('data-release'), '') || '',
+        environment: pick(globalCfg.environment, attr('data-environment'), '') || '',
+        replay: (pick(globalCfg.replay, attr('data-replay'), false) === true ||
+                 pick(globalCfg.replay, attr('data-replay'), false) === 'true' ||
+                 pick(globalCfg.replay, attr('data-replay'), false) === '1'),
+        consent: pick(globalCfg.consent, attr('data-consent'), 'granted') || 'granted'
     };
 
     var INGEST_URL = CONFIG.endpoint + '/api/rum';
@@ -120,8 +124,18 @@
     // ---------------------------------------------------------------------
     // Sampling gate — bail out entirely (and cheaply) for unsampled loads.
     // ---------------------------------------------------------------------
+    var CONSENT = String(CONFIG.consent || 'granted');
     if (Math.random() > CONFIG.sampleRate) {
         log('not sampled (sampleRate=' + CONFIG.sampleRate + '), skipping');
+        window.OpaRum = {
+            flush: function () {},
+            setUser: function () {},
+            addAction: function () {},
+            addTiming: function () {},
+            setAttribute: function () {},
+            setConsent: function (c) { CONSENT = String(c || 'denied'); },
+            getConsent: function () { return CONSENT; }
+        };
         return;
     }
 
@@ -291,6 +305,18 @@
 
     var ajaxRequests = [];
     var errors = [];
+    var customEvents = [];
+    var customTimings = {};
+    var customAttributes = {};
+    var userContext = null;
+    var longTasks = [];
+    var vitalElements = { lcp: null, cls: [], inp: null };
+    var lifecycle = { bfcache: false, prerender: false, navigation_type: '' };
+    var replayChunks = [];
+    var replayBuf = [];
+    var MAX_CUSTOM_EVENTS = 50;
+    var MAX_LONG_TASKS = 50;
+    var MAX_REPLAY_EVENTS = 200;
 
     // "dirty" tracks whether new data has accrued since the last successful
     // flush. First flush always fires; later flushes only fire if something
@@ -332,21 +358,39 @@
 
         if (typeof PerformanceObserver === 'undefined') return;
 
-        // LCP: keep the latest entry's start time.
+        // LCP: keep the latest entry's start time + element selector.
         observe('largest-contentful-paint', function (list) {
             var entries = list.getEntries();
             var last = entries[entries.length - 1];
             if (last) {
                 vitals.lcp = Math.round(last.renderTime || last.loadTime || last.startTime);
+                try {
+                    vitalElements.lcp = {
+                        value: vitals.lcp,
+                        element: cssPath(last.element),
+                        url: last.url || '',
+                        size: last.size || 0
+                    };
+                } catch (e) {}
                 markDirty();
             }
         });
 
-        // CLS: sum values for shifts without recent user input.
+        // CLS: sum values for shifts without recent user input; keep top sources.
         observe('layout-shift', function (list) {
             clsMeasured = true;
             list.getEntries().forEach(function (e) {
-                if (!e.hadRecentInput) { vitals.cls += e.value; markDirty(); }
+                if (!e.hadRecentInput) {
+                    vitals.cls += e.value;
+                    try {
+                        var sources = e.sources || [];
+                        for (var i = 0; i < sources.length && vitalElements.cls.length < 10; i++) {
+                            var node = sources[i] && sources[i].node;
+                            if (node) vitalElements.cls.push({ value: e.value, element: cssPath(node) });
+                        }
+                    } catch (err) {}
+                    markDirty();
+                }
             });
         });
 
@@ -369,10 +413,193 @@
             list.getEntries().forEach(function (e) {
                 if (e.duration && (vitals.inp == null || e.duration > vitals.inp)) {
                     vitals.inp = Math.round(e.duration);
+                    try {
+                        vitalElements.inp = {
+                            value: vitals.inp,
+                            element: cssPath(e.target),
+                            name: e.name || '',
+                            interactionId: e.interactionId || 0
+                        };
+                    } catch (err) {}
                     markDirty();
                 }
             });
         }, { durationThreshold: 40 });
+    }
+
+    // Best-effort CSS path for element-level CWV attribution.
+    function cssPath(el) {
+        try {
+            if (!el || !el.tagName) return '';
+            var parts = [];
+            var cur = el;
+            for (var depth = 0; cur && cur.nodeType === 1 && depth < 5; depth++) {
+                var part = cur.tagName.toLowerCase();
+                if (cur.id) { parts.unshift(part + '#' + cur.id); break; }
+                if (cur.className && typeof cur.className === 'string') {
+                    var cls = cur.className.trim().split(/\s+/).slice(0, 2).join('.');
+                    if (cls) part += '.' + cls;
+                }
+                parts.unshift(part);
+                cur = cur.parentElement;
+            }
+            return parts.join(' > ');
+        } catch (e) { return ''; }
+    }
+
+    function initLongTasks() {
+        if (typeof PerformanceObserver === 'undefined') return;
+        observe('longtask', function (list) {
+            list.getEntries().forEach(function (e) {
+                pushCapped(longTasks, {
+                    type: 'longtask',
+                    start: Math.round(e.startTime),
+                    duration: Math.round(e.duration),
+                    name: e.name || ''
+                }, MAX_LONG_TASKS);
+                markDirty();
+            });
+        });
+        // LoAF (long-animation-frame) when available.
+        observe('long-animation-frame', function (list) {
+            list.getEntries().forEach(function (e) {
+                pushCapped(longTasks, {
+                    type: 'loaf',
+                    start: Math.round(e.startTime),
+                    duration: Math.round(e.duration),
+                    blocking: Math.round(e.blockingDuration || 0),
+                    scripts: (e.scripts && e.scripts.length) || 0
+                }, MAX_LONG_TASKS);
+                markDirty();
+            });
+        });
+    }
+
+    function initLifecycle() {
+        try {
+            var nav = performance.getEntriesByType('navigation')[0];
+            if (nav) {
+                lifecycle.navigation_type = nav.type || '';
+                if (nav.activationStart > 0) lifecycle.prerender = true;
+            }
+        } catch (e) {}
+        try {
+            if (document.prerendering) lifecycle.prerender = true;
+        } catch (e) {}
+        window.addEventListener('pageshow', function (ev) {
+            try {
+                if (ev.persisted) {
+                    lifecycle.bfcache = true;
+                    markDirty();
+                    log('restored from bfcache');
+                }
+            } catch (e) {}
+        });
+    }
+
+    function snapshotConnection() {
+        var out = {};
+        try {
+            var c = navigator.connection || navigator.mozConnection || navigator.webkitConnection;
+            if (c) {
+                if (c.effectiveType) out.effective_type = c.effectiveType;
+                if (c.downlink != null) out.downlink = c.downlink;
+                if (c.rtt != null) out.rtt = c.rtt;
+                if (c.saveData != null) out.save_data = !!c.saveData;
+            }
+        } catch (e) {}
+        return out;
+    }
+
+    function normalizeRoute(href) {
+        try {
+            var path = href;
+            if (typeof URL === 'function') path = new URL(href, window.location.href).pathname;
+            else {
+                var q = path.indexOf('?');
+                if (q >= 0) path = path.slice(0, q);
+                var h = path.indexOf('#');
+                if (h >= 0) path = path.slice(0, h);
+                try {
+                    var a = document.createElement('a');
+                    a.href = href;
+                    path = a.pathname || path;
+                } catch (e) {}
+            }
+            path = path.replace(/\/\d+/g, '/:id');
+            path = path.replace(/\/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}/g, '/:uuid');
+            path = path.replace(/\/[0-9a-fA-F]{16,}/g, '/:hash');
+            return path || '/';
+        } catch (e) { return '/'; }
+    }
+
+    // Lightweight session replay: MutationObserver + input/click events, always masked.
+    var replayChunkIndex = 0;
+    function maskText(s) {
+        try { return String(s == null ? '' : s).replace(/[\S]/g, '*'); } catch (e) { return '****'; }
+    }
+    function pushReplay(ev) {
+        if (!CONFIG.replay || CONSENT !== 'granted') return;
+        pushCapped(replayBuf, ev, MAX_REPLAY_EVENTS);
+        if (replayBuf.length >= MAX_REPLAY_EVENTS) flushReplay();
+    }
+    function flushReplay() {
+        if (!CONFIG.replay || !replayBuf.length || CONSENT !== 'granted') return;
+        var events = replayBuf.splice(0, replayBuf.length);
+        var body = {
+            organization_id: CONFIG.organizationId,
+            project_id: CONFIG.projectId,
+            session_id: SESSION_ID,
+            page_view_id: PAGE_VIEW_ID,
+            chunk_index: replayChunkIndex++,
+            events: events,
+            masked: true
+        };
+        var json;
+        try { json = JSON.stringify(body); } catch (e) { return; }
+        var url = CONFIG.endpoint + '/api/rum/replay';
+        try {
+            if (navigator && typeof navigator.sendBeacon === 'function') {
+                navigator.sendBeacon(url, new Blob([json], { type: 'application/json' }));
+                return;
+            }
+        } catch (e) {}
+        try {
+            fetch(url, { method: 'POST', keepalive: true, headers: { 'Content-Type': 'application/json' }, body: json }).catch(function () {});
+        } catch (e) {}
+    }
+    function initReplay() {
+        if (!CONFIG.replay) return;
+        try {
+            pushReplay({ t: Date.now(), type: 'snapshot', url: PAGE_URL, title: maskText(document.title || '') });
+            var mo = new MutationObserver(function (muts) {
+                for (var i = 0; i < muts.length; i++) {
+                    var m = muts[i];
+                    pushReplay({
+                        t: Date.now(),
+                        type: 'mutation',
+                        mutation: m.type,
+                        target: cssPath(m.target),
+                        added: m.addedNodes ? m.addedNodes.length : 0,
+                        removed: m.removedNodes ? m.removedNodes.length : 0
+                    });
+                }
+            });
+            mo.observe(document.documentElement, { childList: true, subtree: true, attributes: true, characterData: false });
+            document.addEventListener('click', function (e) {
+                pushReplay({ t: Date.now(), type: 'click', target: cssPath(e.target) });
+            }, true);
+            document.addEventListener('input', function (e) {
+                var el = e.target;
+                pushReplay({
+                    t: Date.now(),
+                    type: 'input',
+                    target: cssPath(el),
+                    value: maskText(el && el.value)
+                });
+            }, true);
+            setInterval(flushReplay, 5000);
+        } catch (e) { log('replay init failed', e); }
     }
 
     // Build the web_vitals object with only measured metrics present.
@@ -608,7 +835,11 @@
             IS_SPA_VIEW = true;
             ajaxRequests.length = 0;
             errors.length = 0;
+            longTasks.length = 0;
+            vitalElements = { lcp: null, cls: [], inp: null };
+            customEvents.length = 0;
             dirty = true; // the new view is itself reportable data
+            pushReplay({ t: Date.now(), type: 'navigate', url: PAGE_URL });
             log('spa route change', { pageView: PAGE_VIEW_ID, url: PAGE_URL });
         } catch (e) {}
     }
@@ -636,18 +867,37 @@
     // the JSON body.
     // ---------------------------------------------------------------------
     function buildPayload() {
-        return {
+        var payload = {
             sdk_version: SDK_VERSION,
             organization_id: CONFIG.organizationId,
             project_id: CONFIG.projectId,
             session_id: SESSION_ID,
             page_view_id: PAGE_VIEW_ID,
             page_url: PAGE_URL,
+            route: normalizeRoute(PAGE_URL),
             user_agent: navigator.userAgent,
             timestamp: Date.now(),
+            release: CONFIG.release,
+            environment: CONFIG.environment,
+            consent: CONSENT,
             // SPA views have no Navigation Timing entry of their own.
             navigation_timing: IS_SPA_VIEW ? {} : snapshotNavigation(),
             web_vitals: snapshotVitals(),
+            web_vitals_elements: {
+                lcp: vitalElements.lcp,
+                cls: vitalElements.cls.slice(0, 10),
+                inp: vitalElements.inp
+            },
+            long_tasks: longTasks.slice(0, MAX_LONG_TASKS),
+            lifecycle: {
+                bfcache: !!lifecycle.bfcache,
+                prerender: !!lifecycle.prerender,
+                navigation_type: lifecycle.navigation_type || ''
+            },
+            connection: snapshotConnection(),
+            attributes: customAttributes,
+            custom_events: customEvents.slice(0, MAX_CUSTOM_EVENTS),
+            custom_timings: customTimings,
             resource_timing: snapshotResources(),
             ajax_requests: ajaxRequests.slice(0, MAX_AJAX),
             errors: errors.slice(0, MAX_ERRORS),
@@ -656,11 +906,17 @@
                 height: window.innerHeight || document.documentElement.clientHeight || 0
             }
         };
+        if (userContext) {
+            payload.user = userContext;
+            if (userContext.id != null) payload.user_id = String(userContext.id);
+        }
+        return payload;
     }
 
     function flush() {
         // Only send if new data has accrued since the last flush.
         if (!dirty) { log('flush skipped (not dirty)'); return; }
+        if (CONSENT === 'denied') { log('flush skipped (consent denied)'); dirty = false; return; }
 
         var payload = buildPayload();
         var json;
@@ -694,6 +950,7 @@
 
         if (sent) {
             dirty = false;
+            flushReplay();
             log('flushed', payload);
         }
     }
@@ -702,17 +959,20 @@
     // Wire everything up.
     // ---------------------------------------------------------------------
     initWebVitals();
+    initLongTasks();
+    initLifecycle();
     instrumentFetch();
     instrumentXHR();
     instrumentErrors();
     instrumentHistory();
+    initReplay();
 
     // Flush when the tab is backgrounded/closed — the most reliable moment to
     // capture settled vitals without racing the unload.
     document.addEventListener('visibilitychange', function () {
         if (document.visibilityState === 'hidden') flush();
     });
-    window.addEventListener('pagehide', flush);
+    window.addEventListener('pagehide', function () { flush(); flushReplay(); });
 
     // One-time safety flush shortly after load so very short-lived tabs (that
     // never fire visibilitychange/pagehide) still report at least once.
@@ -725,8 +985,52 @@
         window.addEventListener('load', scheduleSafetyFlush);
     }
 
-    // Manual flush hook — the only global we export.
-    window.OpaRum = { flush: flush };
+    window.OpaRum = {
+        flush: flush,
+        setUser: function (u) {
+            userContext = (u && typeof u === 'object') ? u : null;
+            markDirty();
+        },
+        addAction: function (name, attrs) {
+            pushCapped(customEvents, {
+                name: String(name || ''),
+                attributes: (attrs && typeof attrs === 'object') ? attrs : {},
+                timestamp: Date.now()
+            }, MAX_CUSTOM_EVENTS);
+            markDirty();
+        },
+        addTiming: function (name, ms) {
+            if (!name) return;
+            customTimings[String(name)] = typeof ms === 'number' ? ms : 0;
+            markDirty();
+        },
+        setAttribute: function (k, v) {
+            if (!k) return;
+            customAttributes[String(k)] = v;
+            markDirty();
+        },
+        setConsent: function (c) {
+            CONSENT = String(c || 'denied');
+            markDirty();
+        },
+        getConsent: function () { return CONSENT; },
+        // Framework hooks: call on every SPA route change if History API is not used.
+        notifyRouteChange: onRouteChange,
+        instrumentReactRouter: function (history) {
+            try {
+                if (history && typeof history.listen === 'function') {
+                    history.listen(function () { onRouteChange(); });
+                }
+            } catch (e) {}
+        },
+        instrumentVueRouter: function (router) {
+            try {
+                if (router && typeof router.afterEach === 'function') {
+                    router.afterEach(function () { onRouteChange(); });
+                }
+            } catch (e) {}
+        }
+    };
 
-    log('initialized', { endpoint: CONFIG.endpoint, session: SESSION_ID, pageView: PAGE_VIEW_ID });
+    log('initialized', { endpoint: CONFIG.endpoint, session: SESSION_ID, pageView: PAGE_VIEW_ID, replay: CONFIG.replay });
 })();

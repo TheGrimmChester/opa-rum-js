@@ -128,3 +128,17 @@ and flush on demand.
 ## License
 
 MIT © TheGrimmChester
+
+## Wave 12 (v0.3) API
+
+```js
+OpaRum.setUser({ id: 'u1', email: 'a@b.co' });
+OpaRum.addAction('checkout', { step: 2 });
+OpaRum.addTiming('hero_paint', 312);
+OpaRum.setAttribute('plan', 'pro');
+OpaRum.setConsent('granted'); // or 'denied'
+OpaRum.notifyRouteChange();   // framework routers without History API
+```
+
+Optional session replay: `data-replay="true"` or `{ replay: true }` posts masked mutation/input chunks to `/api/rum/replay`.
+
