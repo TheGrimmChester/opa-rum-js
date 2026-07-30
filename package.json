@@ -1,11 +1,26 @@
 {
   "name": "opa-rum-js",
-  "version": "0.1.0",
-  "description": "Tiny dependency-free Real User Monitoring beacon for the OPA open profiling agent (Core Web Vitals, resource timing, AJAX, JS errors, sessions).",
+  "version": "0.3.0",
+  "description": "Tiny dependency-free Real User Monitoring beacon for the OPA open profiling agent (Core Web Vitals, RUM depth, session replay hooks).",
   "main": "dist/opa-rum.js",
-  "files": ["dist/opa-rum.js", "README.md", "LICENSE"],
-  "keywords": ["rum", "real-user-monitoring", "web-vitals", "apm", "performance", "beacon", "opa"],
-  "repository": { "type": "git", "url": "https://github.com/TheGrimmChester/opa-rum-js.git" },
+  "files": [
+    "dist/opa-rum.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "rum",
+    "real-user-monitoring",
+    "web-vitals",
+    "apm",
+    "performance",
+    "beacon",
+    "opa"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/TheGrimmChester/opa-rum-js.git"
+  },
   "scripts": {
     "test": "node --test test/*.test.js"
   },

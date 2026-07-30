@@ -99,6 +99,12 @@ function loadBeacon(options = {}) {
         // Swallow the 4s safety flush so nothing keeps the test alive.
         setTimeout: () => ({ unref() {} }),
         clearTimeout: () => {},
+        setInterval: () => 0,
+        clearInterval: () => {},
+        MutationObserver: class {
+            observe() {}
+            disconnect() {}
+        },
         // Bare `fetch` references resolve to the same stub the beacon wraps on
         // window (see fetchStub above).
         fetch: fetchStub
@@ -174,7 +180,7 @@ test('flush() sends the full payload via sendBeacon to <endpoint>/api/rum', asyn
     }
 });
 
-test('sampleRate 0 drops the load: no OpaRum global, no beacon', () => {
+test('sampleRate 0 drops the load: stub API only, no beacon', () => {
     const { window, beaconCalls, close } = loadBeacon({
         config: {
             endpoint: 'http://x',
@@ -186,7 +192,9 @@ test('sampleRate 0 drops the load: no OpaRum global, no beacon', () => {
     });
 
     try {
-        assert.strictEqual(window.OpaRum, undefined, 'unsampled load exports nothing');
+        assert.ok(window.OpaRum, 'unsampled load still exports a stub OpaRum API');
+        assert.strictEqual(typeof window.OpaRum.flush, 'function');
+        window.OpaRum.flush();
         assert.strictEqual(beaconCalls.length, 0, 'unsampled load never beacons');
     } finally {
         close();
@@ -243,7 +251,7 @@ test('same-origin AJAX carries a traceparent header and records its trace_id', a
             tp.split('-')[1], entry.trace_id,
             'recorded trace_id matches the trace id sent on the wire'
         );
-        assert.strictEqual(payload.sdk_version, '0.2.0');
+        assert.strictEqual(payload.sdk_version, '0.3.0');
     } finally {
         close();
     }
@@ -305,6 +313,81 @@ test('an SPA route change flushes the old page view and starts a new one', async
         );
         assert.strictEqual(second.session_id, first.session_id, 'the session id is preserved');
         assert.ok(String(second.page_url).endsWith('/next-route'), 'page_url tracks the new route');
+    } finally {
+        close();
+    }
+});
+
+// --- v0.3 / Wave 12 --------------------------------------------------------
+
+test('setUser / addAction / addTiming land in the beacon payload', async () => {
+    const { window, beaconCalls, close } = loadBeacon({
+        config: {
+            endpoint: 'http://x', organizationId: 'o', projectId: 'p', sampleRate: 1,
+            release: '1.2.3', environment: 'prod'
+        }
+    });
+
+    try {
+        window.OpaRum.setUser({ id: 'u-9', email: 'a@b.co' });
+        window.OpaRum.addAction('checkout', { step: 2 });
+        window.OpaRum.addTiming('hero_paint', 312);
+        window.OpaRum.setAttribute('plan', 'pro');
+        window.OpaRum.flush();
+
+        const payload = JSON.parse(await readBody(beaconCalls[0].body));
+        assert.strictEqual(payload.sdk_version, '0.3.0');
+        assert.strictEqual(payload.user_id, 'u-9');
+        assert.strictEqual(payload.user.email, 'a@b.co');
+        assert.strictEqual(payload.release, '1.2.3');
+        assert.strictEqual(payload.environment, 'prod');
+        assert.strictEqual(payload.consent, 'granted');
+        assert.ok(payload.route, 'route is normalized');
+        assert.strictEqual(payload.custom_events.length, 1);
+        assert.strictEqual(payload.custom_events[0].name, 'checkout');
+        assert.strictEqual(payload.custom_timings.hero_paint, 312);
+        assert.strictEqual(payload.attributes.plan, 'pro');
+        assert.ok(payload.web_vitals_elements);
+        assert.ok(Array.isArray(payload.long_tasks));
+        assert.ok(payload.lifecycle && typeof payload.lifecycle === 'object');
+    } finally {
+        close();
+    }
+});
+
+test('consent denied suppresses beacon flush', async () => {
+    const { window, beaconCalls, close } = loadBeacon({
+        config: { endpoint: 'http://x', organizationId: 'o', projectId: 'p', sampleRate: 1, consent: 'denied' }
+    });
+
+    try {
+        window.OpaRum.flush();
+        assert.strictEqual(beaconCalls.length, 0, 'denied consent never beacons');
+        window.OpaRum.setConsent('granted');
+        window.OpaRum.flush();
+        assert.strictEqual(beaconCalls.length, 1, 'granted consent allows flush');
+    } finally {
+        close();
+    }
+});
+
+test('replay=true posts masked chunks to /api/rum/replay', async () => {
+    const { window, beaconCalls, close } = loadBeacon({
+        config: {
+            endpoint: 'http://x', organizationId: 'o', projectId: 'p', sampleRate: 1,
+            replay: true
+        }
+    });
+
+    try {
+        // Trigger a pagehide-style flush path via manual flush (also flushes replay).
+        window.OpaRum.flush();
+        const replay = beaconCalls.filter((c) => String(c.url).endsWith('/api/rum/replay'));
+        assert.ok(replay.length >= 1, 'replay chunk was sent');
+        const chunk = JSON.parse(await readBody(replay[0].body));
+        assert.strictEqual(chunk.masked, true);
+        assert.ok(Array.isArray(chunk.events));
+        assert.ok(chunk.session_id);
     } finally {
         close();
     }
