@@ -572,6 +572,7 @@
         if (!CONFIG.replay) return;
         try {
             pushReplay({ t: Date.now(), type: 'snapshot', url: PAGE_URL, title: maskText(document.title || '') });
+            pushReplay({ t: Date.now(), type: 'navigation', url: PAGE_URL, title: maskText(document.title || '') });
             var mo = new MutationObserver(function (muts) {
                 for (var i = 0; i < muts.length; i++) {
                     var m = muts[i];
@@ -598,6 +599,40 @@
                     value: maskText(el && el.value)
                 });
             }, true);
+            window.addEventListener('popstate', function () {
+                pushReplay({ t: Date.now(), type: 'navigation', url: location.href, title: maskText(document.title || '') });
+            });
+            // Long tasks + resource summaries into the same replay timeline (masked URLs).
+            try {
+                if (typeof PerformanceObserver !== 'undefined') {
+                    observe('longtask', function (list) {
+                        list.getEntries().forEach(function (entry) {
+                            pushReplay({
+                                t: Date.now(),
+                                type: 'longtask',
+                                duration_ms: Math.round(entry.duration || 0),
+                                name: entry.name || 'longtask'
+                            });
+                        });
+                    });
+                    observe('resource', function (list) {
+                        list.getEntries().forEach(function (entry) {
+                            var name = entry.name || '';
+                            try {
+                                var u = new URL(name, location.href);
+                                name = u.origin + u.pathname;
+                            } catch (e2) { name = maskText(name).slice(0, 120); }
+                            pushReplay({
+                                t: Date.now(),
+                                type: 'resource',
+                                url: name,
+                                duration_ms: Math.round(entry.duration || 0),
+                                transfer_size: entry.transferSize || 0
+                            });
+                        });
+                    });
+                }
+            } catch (e3) { /* ignore */ }
             setInterval(flushReplay, 5000);
         } catch (e) { log('replay init failed', e); }
     }
@@ -703,6 +738,23 @@
                     };
                     if (traceId) entry.trace_id = traceId;
                     pushCapped(ajaxRequests, entry, MAX_AJAX);
+                    // Masked AJAX summary into replay timeline (path only).
+                    try {
+                        var pathOnly = url;
+                        try {
+                            var au = new URL(url, location.href);
+                            pathOnly = au.origin + au.pathname;
+                        } catch (e2) { pathOnly = maskText(String(url)).slice(0, 120); }
+                        pushReplay({
+                            t: Date.now(),
+                            type: 'ajax',
+                            method: method,
+                            url: pathOnly,
+                            status: status,
+                            duration_ms: entry.duration,
+                            trace_id: traceId || undefined
+                        });
+                    } catch (e3) {}
                     markDirty();
                 } catch (e) {}
             };
@@ -764,6 +816,22 @@
                         };
                         if (traceId) entry.trace_id = traceId;
                         pushCapped(ajaxRequests, entry, MAX_AJAX);
+                        try {
+                            var xpath = entry.url;
+                            try {
+                                var xu = new URL(entry.url, location.href);
+                                xpath = xu.origin + xu.pathname;
+                            } catch (e2) { xpath = maskText(String(entry.url)).slice(0, 120); }
+                            pushReplay({
+                                t: Date.now(),
+                                type: 'ajax',
+                                method: entry.method,
+                                url: xpath,
+                                status: entry.status,
+                                duration_ms: entry.duration,
+                                trace_id: traceId || undefined
+                            });
+                        } catch (e3) {}
                         markDirty();
                     } catch (e) {}
                 });
@@ -839,7 +907,7 @@
             vitalElements = { lcp: null, cls: [], inp: null };
             customEvents.length = 0;
             dirty = true; // the new view is itself reportable data
-            pushReplay({ t: Date.now(), type: 'navigate', url: PAGE_URL });
+            pushReplay({ t: Date.now(), type: 'navigation', url: PAGE_URL });
             log('spa route change', { pageView: PAGE_VIEW_ID, url: PAGE_URL });
         } catch (e) {}
     }
