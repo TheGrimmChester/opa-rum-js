@@ -1,6 +1,6 @@
 {
   "name": "opa-rum-js",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Tiny dependency-free Real User Monitoring beacon for the OPA open profiling agent (Core Web Vitals, RUM depth, session replay hooks).",
   "main": "dist/opa-rum.js",
   "files": [

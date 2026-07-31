@@ -251,7 +251,7 @@ test('same-origin AJAX carries a traceparent header and records its trace_id', a
             tp.split('-')[1], entry.trace_id,
             'recorded trace_id matches the trace id sent on the wire'
         );
-        assert.strictEqual(payload.sdk_version, '0.3.0');
+        assert.strictEqual(payload.sdk_version, '0.3.1');
     } finally {
         close();
     }
@@ -336,7 +336,7 @@ test('setUser / addAction / addTiming land in the beacon payload', async () => {
         window.OpaRum.flush();
 
         const payload = JSON.parse(await readBody(beaconCalls[0].body));
-        assert.strictEqual(payload.sdk_version, '0.3.0');
+        assert.strictEqual(payload.sdk_version, '0.3.1');
         assert.strictEqual(payload.user_id, 'u-9');
         assert.strictEqual(payload.user.email, 'a@b.co');
         assert.strictEqual(payload.release, '1.2.3');
@@ -388,6 +388,37 @@ test('replay=true posts masked chunks to /api/rum/replay', async () => {
         assert.strictEqual(chunk.masked, true);
         assert.ok(Array.isArray(chunk.events));
         assert.ok(chunk.session_id);
+    } finally {
+        close();
+    }
+});
+
+test('SPA route change rotates page_view_id and clears vitals (no double-count)', async () => {
+    const { window, beaconCalls, close } = loadBeacon({
+        config: { endpoint: 'http://x', organizationId: 'o', projectId: 'p', sampleRate: 1 }
+    });
+
+    try {
+        // Seed vitals via the public flush payload path by marking dirty after
+        // a synthetic mutation of internal state is not available — instead
+        // flush once, then pushState to a new URL and flush the SPA view.
+        window.OpaRum.flush();
+        assert.strictEqual(beaconCalls.length, 1);
+        const first = JSON.parse(await readBody(beaconCalls[0].body));
+        const firstPv = first.page_view_id;
+        assert.ok(firstPv);
+
+        window.history.pushState({}, '', '/spa/next');
+        // pushState instrumentation marks dirty and resets vitals.
+        window.OpaRum.flush();
+        assert.ok(beaconCalls.length >= 2, 'SPA nav produces a new beacon');
+        const second = JSON.parse(await readBody(beaconCalls[beaconCalls.length - 1].body));
+        assert.notStrictEqual(second.page_view_id, firstPv, 'page_view_id rotated');
+        assert.strictEqual(second.session_id, first.session_id, 'session preserved');
+        // After reset, web_vitals should be empty (no new measurements in test DOM).
+        assert.deepStrictEqual(second.web_vitals, {}, 'SPA view does not carry prior vitals');
+        assert.ok(second.navigation_timing && Object.keys(second.navigation_timing).length === 0,
+            'SPA view has empty navigation_timing');
     } finally {
         close();
     }

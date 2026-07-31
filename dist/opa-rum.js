@@ -15,9 +15,9 @@
  *   <script>window.OPA_RUM_CONFIG = { endpoint: "...", organizationId: "...",
  *                                     projectId: "...", sampleRate: 1, debug: false };</script>
  *
- * It captures Core Web Vitals (LCP/CLS/INP/FCP/FID/TTFB), navigation + resource
- * timing, AJAX (fetch + XHR), and JS errors, then ships them to
- * <endpoint>/api/rum via navigator.sendBeacon (fetch keepalive fallback).
+ * It captures Core Web Vitals (LCP/INP/CLS primary; FCP/TTFB; FID legacy),
+ * navigation + resource timing, AJAX (fetch + XHR), and JS errors, then ships
+ * them to <endpoint>/api/rum via navigator.sendBeacon (fetch keepalive fallback).
  *
  * v0.2 additions:
  *   - Trace correlation + SPA page views.
@@ -25,6 +25,9 @@
  *   - Route normalization, setUser/addAction/addTiming, device+connection,
  *     element-level CWV, long tasks, bfcache lifecycle, consent mode,
  *     optional session-replay mutation chunks, framework hooks.
+ * v0.3.1:
+ *   - Reset vitals on SPA navigations (avoid cross-route double-counting);
+ *     interactionId-aware INP (prefer over FID).
  *
  * The JSON payload matches the OPA ingest contract exactly — see main.go
  * (mux.HandleFunc("/api/rum", ...)) and the RUM dashboard.
@@ -32,7 +35,7 @@
 (function () {
     'use strict';
 
-    var SDK_VERSION = '0.3.0';
+    var SDK_VERSION = '0.3.1';
 
     // ---------------------------------------------------------------------
     // Configuration resolution.
@@ -334,6 +337,60 @@
     // ---------------------------------------------------------------------
     var vitals = { lcp: null, cls: 0, inp: null, fcp: null, fid: null, ttfb: null };
     var clsMeasured = false; // CLS legitimately reports 0; track whether we observed it at all.
+    // interactionId → max event duration (ms). INP is the worst interaction, not
+    // the worst single event frame — matches web-vitals / CrUX semantics.
+    var inpByInteraction = {};
+    var spaGeneration = 0; // bump on SPA nav so buffered LCP/FCP entries are ignored
+
+    function resetPageVitals() {
+        vitals = { lcp: null, cls: 0, inp: null, fcp: null, fid: null, ttfb: null };
+        clsMeasured = false;
+        inpByInteraction = {};
+        vitalElements = { lcp: null, cls: [], inp: null };
+        spaGeneration++;
+    }
+
+    function recomputeINP(entry) {
+        var id = entry && entry.interactionId;
+        if (!id) {
+            // No interactionId (Safari / older Chrome): fall back to max duration.
+            if (entry && entry.duration && (vitals.inp == null || entry.duration > vitals.inp)) {
+                vitals.inp = Math.round(entry.duration);
+                try {
+                    vitalElements.inp = {
+                        value: vitals.inp,
+                        element: cssPath(entry.target),
+                        name: entry.name || '',
+                        interactionId: 0
+                    };
+                } catch (err) {}
+                markDirty();
+            }
+            return;
+        }
+        var prev = inpByInteraction[id] || 0;
+        if (!(entry.duration > prev)) return;
+        inpByInteraction[id] = entry.duration;
+        var worst = 0;
+        var worstId = 0;
+        for (var k in inpByInteraction) {
+            if (!Object.prototype.hasOwnProperty.call(inpByInteraction, k)) continue;
+            if (inpByInteraction[k] > worst) {
+                worst = inpByInteraction[k];
+                worstId = Number(k) || k;
+            }
+        }
+        vitals.inp = Math.round(worst);
+        try {
+            vitalElements.inp = {
+                value: vitals.inp,
+                element: cssPath(entry.target),
+                name: entry.name || '',
+                interactionId: worstId
+            };
+        } catch (err) {}
+        markDirty();
+    }
 
     function observe(type, cb, extra) {
         try {
@@ -348,7 +405,7 @@
     }
 
     function initWebVitals() {
-        // TTFB from the navigation entry's responseStart.
+        // TTFB from the navigation entry's responseStart (full loads only).
         try {
             var navEntry = performance.getEntriesByType('navigation')[0];
             if (navEntry && isFinite(navEntry.responseStart)) {
@@ -359,7 +416,10 @@
         if (typeof PerformanceObserver === 'undefined') return;
 
         // LCP: keep the latest entry's start time + element selector.
+        // After SPA route changes, skip: buffered observers would re-attach the
+        // original document LCP to the new page_view_id (double-counting).
         observe('largest-contentful-paint', function (list) {
+            if (IS_SPA_VIEW) return;
             var entries = list.getEntries();
             var last = entries[entries.length - 1];
             if (last) {
@@ -394,37 +454,26 @@
             });
         });
 
-        // FCP: from the 'paint' entries.
+        // FCP: from the 'paint' entries (full document load; not re-emitted on SPA).
         observe('paint', function (list) {
+            if (IS_SPA_VIEW) return;
             list.getEntries().forEach(function (e) {
                 if (e.name === 'first-contentful-paint') { vitals.fcp = Math.round(e.startTime); markDirty(); }
             });
         });
 
-        // FID: processingStart - startTime of the first input.
+        // FID (legacy): first-input delay. Prefer INP for Core Web Vitals.
         observe('first-input', function (list) {
             var e = list.getEntries()[0];
             if (e && vitals.fid == null) { vitals.fid = Math.round(e.processingStart - e.startTime); markDirty(); }
         });
 
-        // INP (approximation): the largest event duration seen. durationThreshold
-        // keeps the observer from firing on trivially fast interactions.
+        // INP: worst interaction (by interactionId), not worst single event frame.
         observe('event', function (list) {
             list.getEntries().forEach(function (e) {
-                if (e.duration && (vitals.inp == null || e.duration > vitals.inp)) {
-                    vitals.inp = Math.round(e.duration);
-                    try {
-                        vitalElements.inp = {
-                            value: vitals.inp,
-                            element: cssPath(e.target),
-                            name: e.name || '',
-                            interactionId: e.interactionId || 0
-                        };
-                    } catch (err) {}
-                    markDirty();
-                }
+                if (e.duration) recomputeINP(e);
             });
-        }, { durationThreshold: 40 });
+        }, { durationThreshold: 16 });
     }
 
     // Best-effort CSS path for element-level CWV attribution.
@@ -904,7 +953,9 @@
             ajaxRequests.length = 0;
             errors.length = 0;
             longTasks.length = 0;
-            vitalElements = { lcp: null, cls: [], inp: null };
+            // Reset CWV so LCP/CLS/INP from the previous route are not
+            // double-counted on the next page_view_id (CrUX field honesty).
+            resetPageVitals();
             customEvents.length = 0;
             dirty = true; // the new view is itself reportable data
             pushReplay({ t: Date.now(), type: 'navigation', url: PAGE_URL });
