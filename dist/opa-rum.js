@@ -21,7 +21,7 @@
  *
  * v0.2 additions:
  *   - Trace correlation + SPA page views.
- * v0.3 (Wave 12):
+ * v0.3 (RUM depth):
  *   - Route normalization, setUser/addAction/addTiming, device+connection,
  *     element-level CWV, long tasks, bfcache lifecycle, consent mode,
  *     optional session-replay mutation chunks, framework hooks.

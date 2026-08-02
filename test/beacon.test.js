@@ -318,7 +318,7 @@ test('an SPA route change flushes the old page view and starts a new one', async
     }
 });
 
-// --- v0.3 / Wave 12 --------------------------------------------------------
+// --- v0.3 / RUM depth --------------------------------------------------------
 
 test('setUser / addAction / addTiming land in the beacon payload', async () => {
     const { window, beaconCalls, close } = loadBeacon({

@@ -4,7 +4,7 @@ Thanks for contributing to Open Profiling Agent (OPA).
 
 ## Development
 
-1. Fork and branch from the current development wave branch or `main`.
+1. Fork and branch from the current development branch or `main`.
 2. Keep changes focused — one concern per PR.
 3. Add or update tests for behavioral changes.
 4. Run the repo's CI-equivalent locally (`go test` / `npm test` / language-specific suites).

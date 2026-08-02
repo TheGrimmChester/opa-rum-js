@@ -129,7 +129,7 @@ and flush on demand.
 
 MIT © TheGrimmChester
 
-## Wave 12 (v0.3) API
+## RUM depth (v0.3) API
 
 ```js
 OpaRum.setUser({ id: 'u1', email: 'a@b.co' });

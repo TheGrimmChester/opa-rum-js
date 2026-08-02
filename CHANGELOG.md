@@ -3,5 +3,5 @@
 ## [Unreleased]
 
 ### Added
-- Wave 16 community files (SECURITY, CONTRIBUTING, CODE_OF_CONDUCT, issue/PR templates).
+- OSS launch community files (SECURITY, CONTRIBUTING, CODE_OF_CONDUCT, issue/PR templates).
 - Licensing FAQ under `docs/LICENSING.md`.
