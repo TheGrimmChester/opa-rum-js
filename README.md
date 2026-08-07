@@ -61,12 +61,15 @@ Or configure via a global before the script loads:
 | `data-endpoint`         | `endpoint`           | same origin | Base origin the beacon POSTs to (`/api/rum` appended). |
 | `data-organization-id`  | `organizationId`     | —           | Public organization id. |
 | `data-project-id`       | `projectId`          | —           | Public project id. |
+| `data-ingest-key`       | `ingestKey`          | —           | Project ingest key (query + body; required when agent auth is on). |
 | `data-sample-rate`      | `sampleRate`         | `1`         | Fraction of sessions to record (`0.1` = 10%). |
 | `data-debug`            | `debug`              | `false`     | Log beacon activity to the console. |
 | `data-trace-propagation-targets` | `tracePropagationTargets` | `[]` (same-origin only) | Extra origins/prefixes allowed to receive the `traceparent` header. Comma-separated in the attribute form, an array in `OPA_RUM_CONFIG`. |
 
-The organization/project ids are **public routing keys**, not secrets — safe to
-embed in client-side HTML.
+The organization/project ids are **public routing keys**. The ingest key is a
+site-scoped token (still required when the agent has `OPA_INGEST_AUTH_REQUIRED=1`);
+it is sent in the beacon query string and JSON body because `sendBeacon` cannot
+set `Authorization` headers.
 
 ## Trace correlation
 

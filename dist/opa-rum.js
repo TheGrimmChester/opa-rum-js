@@ -102,6 +102,7 @@
         endpoint: normEndpoint(pick(globalCfg.endpoint, attr('data-endpoint'))),
         organizationId: pick(globalCfg.organizationId, attr('data-organization-id'), '') || '',
         projectId: pick(globalCfg.projectId, attr('data-project-id'), '') || '',
+        ingestKey: pick(globalCfg.ingestKey, attr('data-ingest-key'), '') || '',
         sampleRate: sampleRate,
         debug: DEBUG,
         tracePropagationTargets: parseTraceTargets(pick(globalCfg.tracePropagationTargets, attr('data-trace-propagation-targets'))),
@@ -114,6 +115,9 @@
     };
 
     var INGEST_URL = CONFIG.endpoint + '/api/rum';
+    if (CONFIG.ingestKey) {
+        INGEST_URL += (INGEST_URL.indexOf('?') >= 0 ? '&' : '?') + 'ingest_key=' + encodeURIComponent(CONFIG.ingestKey);
+    }
 
     // Quiet by default; only chatter when debug is on.
     function log() {
@@ -871,6 +875,7 @@
             sdk_version: SDK_VERSION,
             organization_id: CONFIG.organizationId,
             project_id: CONFIG.projectId,
+            ingest_key: CONFIG.ingestKey || undefined,
             session_id: SESSION_ID,
             page_view_id: PAGE_VIEW_ID,
             page_url: PAGE_URL,
