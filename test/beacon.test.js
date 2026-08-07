@@ -226,6 +226,54 @@ test('config via <script data-*> attributes (document.currentScript)', async () 
     }
 });
 
+test('ingestKey is sent as ?ingest_key= and body field (sendBeacon cannot set Authorization)', async () => {
+    const { window, beaconCalls, close } = loadBeacon({
+        config: {
+            endpoint: 'http://x',
+            organizationId: 'o',
+            projectId: 'p',
+            ingestKey: 'opa_test_ingest_key',
+            sampleRate: 1,
+            debug: false
+        }
+    });
+
+    try {
+        window.OpaRum.flush();
+        assert.strictEqual(beaconCalls.length, 1);
+        assert.ok(
+            beaconCalls[0].url.includes('ingest_key=' + encodeURIComponent('opa_test_ingest_key')),
+            'beacon URL carries ingest_key query'
+        );
+        const payload = JSON.parse(await readBody(beaconCalls[0].body));
+        assert.strictEqual(payload.ingest_key, 'opa_test_ingest_key');
+    } finally {
+        close();
+    }
+});
+
+test('data-ingest-key attribute configures ingestKey', async () => {
+    const { window, beaconCalls, close } = loadBeacon({
+        scriptAttrs: {
+            'data-endpoint': 'http://y',
+            'data-organization-id': 'o',
+            'data-project-id': 'p',
+            'data-ingest-key': 'opa_from_attr',
+            'data-sample-rate': '1'
+        }
+    });
+
+    try {
+        window.OpaRum.flush();
+        assert.strictEqual(beaconCalls.length, 1);
+        assert.ok(beaconCalls[0].url.includes('ingest_key=opa_from_attr'));
+        const payload = JSON.parse(await readBody(beaconCalls[0].body));
+        assert.strictEqual(payload.ingest_key, 'opa_from_attr');
+    } finally {
+        close();
+    }
+});
+
 // --- v0.2: RUM ↔ trace correlation -----------------------------------------
 
 test('same-origin AJAX carries a traceparent header and records its trace_id', async () => {
